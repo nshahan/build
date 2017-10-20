@@ -41,9 +41,17 @@ class BuildDefinition {
 
   final PackageGraph packageGraph;
   final bool deleteFilesByDefault;
+  final String buildDir;
 
-  BuildDefinition._(this.assetGraph, this.updates, this.conflictingAssets,
-      this.reader, this.writer, this.packageGraph, this.deleteFilesByDefault);
+  BuildDefinition._(
+      this.assetGraph,
+      this.updates,
+      this.conflictingAssets,
+      this.reader,
+      this.writer,
+      this.packageGraph,
+      this.deleteFilesByDefault,
+      this.buildDir);
 
   static Future<BuildDefinition> load(
           BuildOptions options, List<BuildAction> buildActions) =>
@@ -103,11 +111,18 @@ class _Loader {
     if (_options.writeToCache) {
       reader = new BuildCacheReader(
           reader, assetGraph, _options.packageGraph.root.name);
-      writer = new BuildCacheWriter(
-          writer, assetGraph, _options.packageGraph.root.name);
+      writer = new BuildCacheWriter(writer, assetGraph,
+          _options.packageGraph.root.name, _options.buildDir);
     }
-    return new BuildDefinition._(assetGraph, updates, conflictingOutputs,
-        reader, writer, _options.packageGraph, _options.deleteFilesByDefault);
+    return new BuildDefinition._(
+        assetGraph,
+        updates,
+        conflictingOutputs,
+        reader,
+        writer,
+        _options.packageGraph,
+        _options.deleteFilesByDefault,
+        _options.buildDir);
   }
 
   /// Reads in an [AssetGraph] from disk.

@@ -11,6 +11,7 @@ import 'package:build/src/builder/logging.dart';
 import 'package:build_barback/build_barback.dart' show BarbackResolvers;
 import 'package:build_runner/src/util/clock.dart';
 import 'package:logging/logging.dart';
+import 'package:path/path.dart' as p;
 import 'package:stack_trace/stack_trace.dart';
 import 'package:watcher/watcher.dart';
 
@@ -54,12 +55,15 @@ class BuildImpl {
 
   final _OnDelete _onDelete;
 
+  final String _buildDir;
+
   BuildImpl._(
       BuildDefinition buildDefinition, this._buildActions, this._onDelete)
       : _packageGraph = buildDefinition.packageGraph,
         _reader = buildDefinition.reader,
         _writer = buildDefinition.writer,
-        _assetGraph = buildDefinition.assetGraph;
+        _assetGraph = buildDefinition.assetGraph,
+        _buildDir = buildDefinition.buildDir;
 
   static Future<BuildImpl> create(
       BuildDefinition buildDefinition, List<BuildAction> buildActions,
@@ -122,6 +126,51 @@ class BuildImpl {
             new AssetId(_packageGraph.root.name, assetGraphPath),
             JSON.encode(_assetGraph.serialize()));
       });
+
+      if (_buildDir != null) {
+        await logTimedAsync(_logger, 'Creating merged build directory',
+            () async {
+          var dir = new Directory(_buildDir);
+          if (await dir.exists()) await dir.delete(recursive: true);
+          await dir.create(recursive: true);
+
+          var rootDirs = new Set<String>();
+          for (var node in _assetGraph.packageNodes(_packageGraph.root.name)) {
+            var parts = p.url.split(node.id.path);
+            if (parts.length == 1) continue;
+            rootDirs.add(parts.first);
+          }
+
+          await Future.wait(_assetGraph.allNodes.map((node) async {
+            if (node is GeneratedAssetNode && !node.wasOutput) return;
+            if (node.id.path == '.packages') return;
+            var bytes = await _reader.readAsBytes(node.id);
+            var assetPaths = <String>[];
+            if (node.id.path.startsWith('lib')) {
+              for (var dir in rootDirs) {
+                assetPaths.add(p.url.join(_buildDir, dir, 'packages',
+                    node.id.package, node.id.path.substring('lib/'.length)));
+              }
+            } else {
+              assetPaths.add(p.url.join(_buildDir, node.id.path));
+            }
+            for (var path in assetPaths) {
+              var outputId = new AssetId(_packageGraph.root.name, path);
+              await _writer.writeAsBytes(outputId, bytes);
+            }
+          }));
+
+          var packagesFileContent = _packageGraph.allPackages.keys
+              .map((p) => '$p:packages/$p/')
+              .join('\r\n');
+          for (var dir in rootDirs) {
+            await _writer.writeAsString(
+                new AssetId(_packageGraph.root.name,
+                    p.url.join(_buildDir, dir, '.packages')),
+                packagesFileContent);
+          }
+        });
+      }
 
       done.complete(result);
     }, onError: (e, Chain chain) {

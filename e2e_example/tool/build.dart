@@ -36,6 +36,7 @@ Future main() async {
 
   var serveHandler = await watch(
     buildActions,
+    buildDir: 'build',
     deleteFilesByDefault: true,
     writeToCache: true,
   );

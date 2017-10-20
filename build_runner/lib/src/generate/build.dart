@@ -42,7 +42,8 @@ import 'watch_impl.dart';
 /// will simply consume the first event and allow the build to continue.
 /// Multiple termination events will cause a normal shutdown.
 Future<BuildResult> build(List<BuildAction> buildActions,
-    {bool deleteFilesByDefault,
+    {String buildDir,
+    bool deleteFilesByDefault,
     bool writeToCache,
     PackageGraph packageGraph,
     RunnerAssetReader reader,
@@ -51,6 +52,7 @@ Future<BuildResult> build(List<BuildAction> buildActions,
     onLog(LogRecord record),
     Stream terminateEventStream}) async {
   var options = new BuildOptions(
+      buildDir: buildDir,
       deleteFilesByDefault: deleteFilesByDefault,
       writeToCache: writeToCache,
       packageGraph: packageGraph,
@@ -88,7 +90,8 @@ Future<BuildResult> build(List<BuildAction> buildActions,
 ///  will complete normally. Subsequent events are not handled (and will
 ///  typically cause a shutdown).
 Future<ServeHandler> watch(List<BuildAction> buildActions,
-    {bool deleteFilesByDefault,
+    {String buildDir,
+    bool deleteFilesByDefault,
     bool writeToCache,
     PackageGraph packageGraph,
     RunnerAssetReader reader,
@@ -99,6 +102,7 @@ Future<ServeHandler> watch(List<BuildAction> buildActions,
     DirectoryWatcherFactory directoryWatcherFactory,
     Stream terminateEventStream}) {
   var options = new BuildOptions(
+      buildDir: buildDir,
       deleteFilesByDefault: deleteFilesByDefault,
       writeToCache: writeToCache,
       packageGraph: packageGraph,

@@ -42,6 +42,8 @@ typedef Future<BuildResult> _BuildAction(List<List<AssetChange>> changes);
 class WatchImpl implements BuildState {
   AssetGraph _assetGraph;
 
+  final String _buildDir;
+
   /// Delay to wait for more file watcher events.
   final Duration _debounceDelay;
 
@@ -61,7 +63,8 @@ class WatchImpl implements BuildState {
   Future<AssetReader> get reader => _readerCompleter.future;
 
   WatchImpl(BuildOptions options, List<BuildAction> buildActions, Future until)
-      : _directoryWatcherFactory = options.directoryWatcherFactory,
+      : _buildDir = options.buildDir,
+        _directoryWatcherFactory = options.directoryWatcherFactory,
         _debounceDelay = options.debounceDelay,
         packageGraph = options.packageGraph {
     buildResults = _run(options, buildActions, until).asBroadcastStream();
@@ -148,6 +151,7 @@ class WatchImpl implements BuildState {
   /// Checks if we should skip a watch event for this [change].
   bool _shouldProcess(AssetChange change) {
     assert(_assetGraph != null);
+    if (_isBuildDirFile(change)) return false;
     if (_isCacheFile(change)) return false;
     if (_isGitFile(change)) return false;
     if (_hasNoOutputs(change)) return false;
@@ -156,6 +160,10 @@ class WatchImpl implements BuildState {
     if (_isUnwatchedDelete(change)) return false;
     return true;
   }
+
+  bool _isBuildDirFile(AssetChange change) =>
+      change.id.package == packageGraph.root.name &&
+      change.id.path.startsWith(_buildDir);
 
   bool _isCacheFile(AssetChange change) => change.id.path.startsWith(cacheDir);
 

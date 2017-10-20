@@ -40,25 +40,32 @@ class BuildCacheWriter implements RunnerAssetWriter {
   final RunnerAssetWriter _delegate;
   final AssetGraph _assetGraph;
   final String _rootPackage;
+  // Allow writing to the the output build directory.
+  final String _buildDir;
 
-  BuildCacheWriter(this._delegate, this._assetGraph, this._rootPackage);
+  BuildCacheWriter(
+      this._delegate, this._assetGraph, this._rootPackage, this._buildDir);
 
   @override
   Future writeAsBytes(AssetId id, List<int> content) => _delegate.writeAsBytes(
-      cacheLocation(id, _assetGraph, _rootPackage), content);
+      cacheLocation(id, _assetGraph, _rootPackage, buildDir: _buildDir),
+      content);
   @override
   Future writeAsString(AssetId id, String content, {Encoding encoding: UTF8}) =>
       _delegate.writeAsString(
-          cacheLocation(id, _assetGraph, _rootPackage), content,
+          cacheLocation(id, _assetGraph, _rootPackage, buildDir: _buildDir),
+          content,
           encoding: encoding);
   @override
-  Future delete(AssetId id) =>
-      _delegate.delete(cacheLocation(id, _assetGraph, _rootPackage));
+  Future delete(AssetId id) => _delegate.delete(
+      cacheLocation(id, _assetGraph, _rootPackage, buildDir: _buildDir));
 }
 
-AssetId cacheLocation(AssetId id, AssetGraph assetGraph, String rootPackage) {
+AssetId cacheLocation(AssetId id, AssetGraph assetGraph, String rootPackage,
+    {String buildDir}) {
   if (id.path.startsWith(generatedOutputDirectory) ||
-      id.path.startsWith(cacheDir)) {
+      id.path.startsWith(cacheDir) ||
+      (buildDir != null && id.path.startsWith(buildDir))) {
     return id;
   }
   if (!assetGraph.contains(id)) {
