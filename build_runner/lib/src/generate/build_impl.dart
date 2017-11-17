@@ -177,6 +177,7 @@ class BuildImpl {
           }
 
           await Future.wait(_assetGraph.allNodes.map((node) async {
+            if (node is SyntheticAssetNode) return;
             if (node is GeneratedAssetNode && !node.wasOutput) return;
             if (node.id.path == '.packages') return;
             var bytes = await _reader.readAsBytes(node.id);
