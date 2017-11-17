@@ -109,20 +109,25 @@ class Module extends Object with _$ModuleSerializerMixin {
 
   /// Computes the [primarySource]s of all [Module]s that are transitively
   /// depended on by this module.
-  Future<Set<AssetId>> computeTransitiveDependencies(AssetReader reader) async {
-    var transitiveDeps = new Set<AssetId>();
+  Future<List<Module>> computeTransitiveDependencies(AssetReader reader) async {
+    var transitiveDeps = <AssetId, Module>{};
     var modulesToCrawl = directDependencies.toSet();
     while (modulesToCrawl.isNotEmpty) {
       var next = modulesToCrawl.last;
       modulesToCrawl.remove(next);
-      if (transitiveDeps.contains(next)) continue;
-      transitiveDeps.add(next);
-      var module = new Module.fromJson(JSON.decode(
-              await reader.readAsString(next.changeExtension(moduleExtension)))
-          as Map<String, dynamic>);
+      if (transitiveDeps.containsKey(next)) continue;
+      var nextModuleId = next.changeExtension(moduleExtension);
+      if (!await reader.canRead(nextModuleId)) {
+        log.warning('Missing module $nextModuleId');
+        continue;
+      }
+      var module = new Module.fromJson(
+          JSON.decode(await reader.readAsString(nextModuleId))
+              as Map<String, dynamic>);
+      transitiveDeps[next] = module;
       modulesToCrawl.addAll(module.directDependencies);
     }
-    return transitiveDeps;
+    return transitiveDeps.values.toList();
   }
 }
 

@@ -10,6 +10,8 @@ import 'package:test/test.dart';
 import 'package:build_test/build_test.dart';
 import 'package:build_runner/build_runner.dart';
 
+import 'package:build_runner/src/generate/build_impl.dart' as build_impl;
+
 import 'in_memory_reader.dart';
 import 'in_memory_writer.dart';
 
@@ -64,16 +66,18 @@ Future<BuildResult> testActions(List<BuildAction> buildActions,
     PackageGraph packageGraph,
     BuildStatus status: BuildStatus.success,
     Matcher exceptionMatcher,
+    InMemoryRunnerAssetReader reader,
     InMemoryRunnerAssetWriter writer,
     Level logLevel: Level.OFF,
     onLog(LogRecord record),
     bool writeToCache,
     bool checkBuildStatus: true,
-    bool deleteFilesByDefault: true}) async {
+    bool deleteFilesByDefault: true,
+    bool enableLowResourcesMode: false}) async {
   writer ??= new InMemoryRunnerAssetWriter();
   writeToCache ??= false;
   final actualAssets = writer.assets;
-  final reader =
+  reader ??=
       new InMemoryRunnerAssetReader(actualAssets, packageGraph?.root?.name);
 
   inputs.forEach((serializedId, contents) {
@@ -90,14 +94,16 @@ Future<BuildResult> testActions(List<BuildAction> buildActions,
     packageGraph = new PackageGraph.fromRoot(rootPackage);
   }
 
-  var result = await build(buildActions,
+  var result = await build_impl.build(buildActions,
       deleteFilesByDefault: deleteFilesByDefault,
       writeToCache: writeToCache,
       reader: reader,
       writer: writer,
       packageGraph: packageGraph,
       logLevel: logLevel,
-      onLog: onLog);
+      onLog: onLog,
+      skipBuildScriptCheck: true,
+      enableLowResourcesMode: enableLowResourcesMode);
 
   if (checkBuildStatus) {
     checkBuild(result,

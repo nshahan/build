@@ -9,12 +9,15 @@ import 'package:build/build.dart';
 import 'package:build/src/builder/build_step_impl.dart';
 import 'package:build/src/builder/logging.dart';
 import 'package:build_barback/build_barback.dart' show BarbackResolvers;
-import 'package:build_runner/src/util/clock.dart';
+import 'package:convert/convert.dart';
+import 'package:crypto/crypto.dart';
+import 'package:glob/glob.dart';
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as p;
 import 'package:stack_trace/stack_trace.dart';
 import 'package:watcher/watcher.dart';
 
+import '../asset/cache.dart';
 import '../asset/reader.dart';
 import '../asset/writer.dart';
 import '../asset_graph/graph.dart';
@@ -31,52 +34,83 @@ import 'input_set.dart';
 import 'options.dart';
 import 'performance_tracker.dart';
 import 'phase.dart';
+import 'terminator.dart';
 
 final _logger = new Logger('Build');
 
-Future<BuildResult> singleBuild(
-    BuildOptions options, List<BuildAction> buildActions) async {
-  var buildDefinition = await BuildDefinition.load(options, buildActions);
-  return (await BuildImpl.create(buildDefinition, buildActions)).firstBuild;
+Future<BuildResult> build(List<BuildAction> buildActions,
+    {String buildDir,
+    bool deleteFilesByDefault,
+    bool writeToCache,
+    PackageGraph packageGraph,
+    RunnerAssetReader reader,
+    RunnerAssetWriter writer,
+    Level logLevel,
+    onLog(LogRecord record),
+    Stream terminateEventStream,
+    bool skipBuildScriptCheck,
+    bool enableLowResourcesMode}) async {
+  var options = new BuildOptions(
+      buildDir: buildDir,
+      deleteFilesByDefault: deleteFilesByDefault,
+      writeToCache: writeToCache,
+      packageGraph: packageGraph,
+      reader: reader,
+      writer: writer,
+      logLevel: logLevel,
+      onLog: onLog,
+      skipBuildScriptCheck: skipBuildScriptCheck,
+      enableLowResourcesMode: enableLowResourcesMode);
+  var terminator = new Terminator(terminateEventStream);
+
+  var result = await singleBuild(options, buildActions);
+
+  await terminator.cancel();
+  await options.logListener.cancel();
+  return result;
 }
 
-typedef void _OnDelete(AssetId id);
+Future<BuildResult> singleBuild(
+    BuildOptions options, List<BuildAction> buildActions) async {
+  var buildDefinition =
+      await BuildDefinition.prepareWorkspace(options, buildActions);
+  var result =
+      (await BuildImpl.create(buildDefinition, buildActions)).firstBuild;
+  await buildDefinition.resourceManager.beforeExit();
+  return result;
+}
 
 class BuildImpl {
   BuildResult _firstBuild;
   BuildResult get firstBuild => _firstBuild;
 
-  final List<BuildAction> _buildActions;
-  final PackageGraph _packageGraph;
-  final AssetReader _reader;
-  final RunnerAssetWriter _writer;
-  final _resolvers = const BarbackResolvers();
   final AssetGraph _assetGraph;
-
-  final _OnDelete _onDelete;
-
+  final List<BuildAction> _buildActions;
+  final OnDelete _onDelete;
+  final PackageGraph _packageGraph;
+  final DigestAssetReader _reader;
+  final _resolvers = const BarbackResolvers();
+  final ResourceManager _resourceManager;
+  final RunnerAssetWriter _writer;
   final String _buildDir;
 
-  BuildImpl._(
-      BuildDefinition buildDefinition, this._buildActions, this._onDelete)
+  BuildImpl._(BuildDefinition buildDefinition, this._buildActions)
       : _packageGraph = buildDefinition.packageGraph,
-        _reader = buildDefinition.reader,
+        _reader = buildDefinition.enableLowResourcesMode
+            ? buildDefinition.reader
+            : new CachingAssetReader(buildDefinition.reader),
         _writer = buildDefinition.writer,
         _assetGraph = buildDefinition.assetGraph,
-        _buildDir = buildDefinition.buildDir;
+        _buildDir = buildDefinition.buildDir,
+        _resourceManager = buildDefinition.resourceManager,
+        _onDelete = buildDefinition.onDelete;
 
   static Future<BuildImpl> create(
       BuildDefinition buildDefinition, List<BuildAction> buildActions,
       {void onDelete(AssetId id)}) async {
-    var build = new BuildImpl._(buildDefinition, buildActions, onDelete);
+    var build = new BuildImpl._(buildDefinition, buildActions);
 
-    await logTimedAsync(
-        _logger,
-        'Checking for stale files',
-        () => build._firstBuildCleanup(buildDefinition.conflictingAssets,
-            buildDefinition.deleteFilesByDefault));
-
-    build._firstBuild = await build.run(buildDefinition.updates);
+    build._firstBuild = await build.run({});
     return build;
   }
 
@@ -87,9 +121,8 @@ class BuildImpl {
       await logTimedAsync(
           _logger, 'Updating asset graph', () => _updateAssetGraph(updates));
     }
-    var resourceManager = new ResourceManager();
-    var result = await _safeBuild(resourceManager);
-    await resourceManager.disposeAll();
+    var result = await _safeBuild(_resourceManager);
+    await _resourceManager.disposeAll();
     if (result.status == BuildStatus.success) {
       _logger.info('Succeeded after ${watch.elapsedMilliseconds}ms with '
           '${result.outputs.length} outputs\n\n');
@@ -104,15 +137,18 @@ class BuildImpl {
     return result;
   }
 
-  Future<Null> _updateAssetGraph(Map<AssetId, ChangeType> updates) =>
-      _assetGraph.updateAndInvalidate(
-          _buildActions, updates, _packageGraph.root.name, _delete);
+  Future<Null> _updateAssetGraph(Map<AssetId, ChangeType> updates) async {
+    var invalidated = await _assetGraph.updateAndInvalidate(
+        _buildActions, updates, _packageGraph.root.name, _delete, _reader);
+    if (_reader is CachingAssetReader) {
+      (_reader as CachingAssetReader).invalidate(invalidated);
+    }
+  }
 
   /// Runs a build inside a zone with an error handler and stack chain
   /// capturing.
   Future<BuildResult> _safeBuild(ResourceManager resourceManager) {
     var done = new Completer<BuildResult>();
-    var buildStartTime = now();
     Chain.capture(() async {
       // Run a fresh build.
       var result = await logTimedAsync(
@@ -121,7 +157,6 @@ class BuildImpl {
       // Write out the dependency graph file.
       await logTimedAsync(_logger, 'Caching finalized dependency graph',
           () async {
-        _assetGraph.validAsOf = buildStartTime;
         await _writer.writeAsString(
             new AssetId(_packageGraph.root.name, assetGraphPath),
             JSON.encode(_assetGraph.serialize()));
@@ -181,58 +216,6 @@ class BuildImpl {
     return done.future;
   }
 
-  Future<Null> _firstBuildCleanup(
-      Set<AssetId> conflictingAssets, bool deleteFilesByDefault) async {
-    if (conflictingAssets.isEmpty) return;
-
-    // Skip the prompt if using this option.
-    if (deleteFilesByDefault) {
-      _logger.info('Deleting ${conflictingAssets.length} declared outputs '
-          'which already existed on disk.');
-      await Future.wait(conflictingAssets.map(_delete));
-      return;
-    }
-
-    // Prompt the user to delete files that are declared as outputs.
-    _logger.info('Found ${conflictingAssets.length} declared outputs '
-        'which already exist on disk. This is likely because the'
-        '`$cacheDir` folder was deleted, or you are submitting generated '
-        'files to your source repository.');
-
-    // If not in a standard terminal then we just exit, since there is no way
-    // for the user to provide a yes/no answer.
-    bool runningInPubRunTest() => Platform.script.scheme == 'data';
-    if (stdioType(stdin) != StdioType.TERMINAL || runningInPubRunTest()) {
-      throw new UnexpectedExistingOutputsException(conflictingAssets);
-    }
-
-    // Give a little extra space after the last message, need to make it clear
-    // this is a prompt.
-    stdout.writeln();
-    var done = false;
-    while (!done) {
-      stdout.write('\nDelete these files (y/n) (or list them (l))?: ');
-      var input = stdin.readLineSync();
-      switch (input.toLowerCase()) {
-        case 'y':
-          stdout.writeln('Deleting files...');
-          done = true;
-          await Future.wait(conflictingAssets.map(_delete));
-          break;
-        case 'n':
-          throw new UnexpectedExistingOutputsException(conflictingAssets);
-          break;
-        case 'l':
-          for (var output in conflictingAssets) {
-            stdout.writeln(output);
-          }
-          break;
-        default:
-          stdout.writeln('Unrecognized option $input, (y/n/l) expected.');
-      }
-    }
-  }
-
   /// Runs the actions in [_buildActions] and returns a [Future<BuildResult>]
   /// which completes once all [BuildAction]s are done.
   Future<BuildResult> _runPhases(ResourceManager resourceManager) async {
@@ -246,10 +229,10 @@ class BuildImpl {
           outputs.addAll(await _runPackageBuilder(
               phase, action.package, action.builder, resourceManager));
         } else if (action is AssetBuildAction) {
-          var inputs =
-              await _matchingInputs(action.inputSet, phase, resourceManager);
+          var primaryInputs =
+              await _matchingPrimaryInputs(action, phase, resourceManager);
           outputs.addAll(await _runBuilder(
-              phase, action.builder, inputs, resourceManager));
+              phase, action.builder, primaryInputs, resourceManager));
         } else {
           throw new InvalidBuildActionException.unrecognizedType(action);
         }
@@ -263,15 +246,24 @@ class BuildImpl {
         performance: performanceTracker..stop());
   }
 
-  /// Gets a list of all inputs matching [inputSet].
+  /// Gets a list of all inputs matching the [InputSet] of [action], as well as
+  /// its [Builder]s primary inputs.
   ///
-  /// Lazily builds any optional build actions matching [inputSet].
-  Future<Set<AssetId>> _matchingInputs(InputSet inputSet, int phaseNumber,
-      ResourceManager resourceManager) async {
+  /// Lazily builds any optional build actions that might potentially produce
+  /// a primary input to [action].
+  Future<Set<AssetId>> _matchingPrimaryInputs(AssetBuildAction action,
+      int phaseNumber, ResourceManager resourceManager) async {
     var ids = new Set<AssetId>();
+    var inputSet = action.inputSet;
+    var builder = action.builder;
     await Future
         .wait(_assetGraph.packageNodes(inputSet.package).map((node) async {
+      if (node is SyntheticAssetNode) return;
       if (!inputSet.matches(node.id)) return;
+      if (!builder.buildExtensions.keys
+          .any((inputExtension) => node.id.path.endsWith(inputExtension))) {
+        return;
+      }
       if (node is GeneratedAssetNode) {
         if (node.phaseNumber >= phaseNumber) return;
         if (node.needsUpdate) {
@@ -308,7 +300,7 @@ class BuildImpl {
       // actually output. If it wasn't then we just return an empty list here.
       var inputNode = _assetGraph.get(input);
       if (inputNode is GeneratedAssetNode) {
-        // Make sure the `inputNode` is up to date, generate run it.
+        // Make sure the `inputNode` is up to date, and rebuild it if not.
         if (inputNode.needsUpdate) {
           await _runLazyPhaseForInput(
               inputNode.phaseNumber, inputNode.primaryInput, resourceManager);
@@ -340,26 +332,34 @@ class BuildImpl {
         'Inputs should be known in the static graph. Missing $input');
     assert(
         inputNode.primaryOutputs.containsAll(builderOutputs),
-        '$input missing primary outputs ' +
+        'input $input with builder $builder missing primary outputs: \n' +
+            'Got ${inputNode.primaryOutputs.join(', ')} which was missing:\n' +
             builderOutputs
                 .where((id) => !inputNode.primaryOutputs.contains(id))
                 .join(', '));
 
-    if (!_buildShouldRun(builderOutputs)) return <AssetId>[];
-
-    var wrappedReader = new SinglePhaseReader(
+    var wrappedReader = new SingleStepReader(
         _reader,
         _assetGraph,
         phaseNumber,
         input.package,
         (phase, input) => _runLazyPhaseForInput(phase, input, resourceManager));
+
+    if (!await _buildShouldRun(builderOutputs, wrappedReader)) {
+      return <AssetId>[];
+    }
+    // We may have read some inputs in the call to `_buildShouldRun`, we want
+    // to remove those.
+    wrappedReader.assetsRead.clear();
+
     var wrappedWriter = new AssetWriterSpy(_writer);
+    var logger = new Logger('$builder on $input');
     await runBuilder(builder, [input], wrappedReader, wrappedWriter, _resolvers,
-        resourceManager: resourceManager);
+        logger: logger, resourceManager: resourceManager);
 
     // Reset the state for all the `builderOutputs` nodes based on what was
     // read and written.
-    _setOutputsState(builderOutputs, wrappedReader, wrappedWriter);
+    await _setOutputsState(builderOutputs, wrappedReader, wrappedWriter);
 
     return wrappedWriter.assetsWritten;
   }
@@ -373,42 +373,103 @@ class BuildImpl {
       PackageBuilder builder, ResourceManager resourceManager) async {
     var builderOutputs = outputIdsForBuilder(builder, package);
 
-    if (!_buildShouldRun(builderOutputs)) return <AssetId>[];
-
-    var wrappedReader = new SinglePhaseReader(
+    var wrappedReader = new SingleStepReader(
         _reader,
         _assetGraph,
         phaseNumber,
         package,
         (phase, input) => _runLazyPhaseForInput(phase, input, resourceManager));
+
+    if (!await _buildShouldRun(builderOutputs, wrappedReader)) {
+      return <AssetId>[];
+    }
+    // We may have read some inputs in the call to `_buildShouldRun`, we want
+    // to remove those.
+    wrappedReader.assetsRead.clear();
+
     var wrappedWriter = new AssetWriterSpy(_writer);
 
-    var logger = new Logger('runBuilder');
+    var logger = new Logger('$builder on $package');
     var buildStep = new BuildStepImpl(null, builderOutputs, wrappedReader,
         wrappedWriter, _packageGraph.root.name, _resolvers, resourceManager);
     try {
-      await scopeLog(() => builder.build(buildStep), logger);
+      // Wrapping in `new Future.value` to work around
+      // https://github.com/dart-lang/sdk/issues/31237, users might return
+      // synchronously and not have any analysis errors today.
+      await scopeLogAsync(
+          () => new Future.value(builder.build(buildStep)), logger);
     } finally {
       await buildStep.complete();
     }
 
     // Reset the state for all the `builderOutputs` nodes based on what was
     // read and written.
-    _setOutputsState(builderOutputs, wrappedReader, wrappedWriter);
+    await _setOutputsState(builderOutputs, wrappedReader, wrappedWriter);
 
     return wrappedWriter.assetsWritten;
   }
 
   /// Checks and returns whether any [outputs] need to be updated.
-  bool _buildShouldRun(Iterable<AssetId> outputs) {
+  Future<bool> _buildShouldRun(
+      Iterable<AssetId> outputs, DigestAssetReader reader) async {
     assert(
         outputs.every((o) => _assetGraph.contains(o)),
         'Outputs should be known statically. Missing '
         '${outputs.where((o) => !_assetGraph.contains(o)).toList()}');
+    assert(outputs.length >= 1, 'Can\'t run a build with zero outputs');
+    var firstOutput = outputs.first;
+    var node = _assetGraph.get(firstOutput) as GeneratedAssetNode;
+    assert(
+        outputs.skip(1).every((output) =>
+            (_assetGraph.get(output) as GeneratedAssetNode)
+                .inputs
+                .difference(node.inputs)
+                .isEmpty),
+        'All outputs of a build action should share the same inputs.');
 
-    // A build should be ran if any output needs updating
-    return outputs.any((output) =>
-        (_assetGraph.get(output) as GeneratedAssetNode).needsUpdate);
+    // We only check the first output, because all outputs share the same inputs
+    // and invalidation state.
+    if (!node.needsUpdate) return false;
+    // TODO: Don't assume the worst for globs
+    // https://github.com/dart-lang/build/issues/624
+    if (node.previousInputsDigest == null || node.globs.isNotEmpty) {
+      return true;
+    }
+    var digest = await _computeCombinedDigest(node.inputs, reader);
+    if (digest != node.previousInputsDigest) {
+      return true;
+    } else {
+      // Make sure to update the `needsUpdate` field for all outputs.
+      for (var id in outputs) {
+        (_assetGraph.get(id) as GeneratedAssetNode).needsUpdate = false;
+      }
+      return false;
+    }
+  }
+
+  /// Computes a single [Digest] based on the combined [Digest]s of [ids].
+  Future<Digest> _computeCombinedDigest(
+      Iterable<AssetId> ids, DigestAssetReader reader) async {
+    var digestSink = new AccumulatorSink<Digest>();
+    var bytesSink = md5.startChunkedConversion(digestSink);
+
+    for (var id in ids) {
+      var node = _assetGraph.get(id);
+      if (node is SyntheticAssetNode || !await reader.canRead(id)) {
+        // We want to add something here, a missing/unreadable input should be
+        // different from no input at all.
+        bytesSink.add([1]);
+        continue;
+      }
+      if (node.lastKnownDigest == null) {
+        node.lastKnownDigest = await reader.digest(id);
+      }
+      bytesSink.add(node.lastKnownDigest.bytes);
+    }
+
+    bytesSink.close();
+    assert(digestSink.events.length == 1);
+    return digestSink.events.first;
   }
 
   /// Sets the state for all [declaredOutputs] of a build step, by:
@@ -417,29 +478,64 @@ class BuildImpl {
   /// - Setting `wasOutput` based on `writer.assetsWritten`.
   /// - Setting `globs` on each output based on `reader.globsRan`
   /// - Adding `declaredOutputs` as outputs to all `reader.assetsRead`.
-  void _setOutputsState(Iterable<AssetId> declaredOutputs,
-      SinglePhaseReader reader, AssetWriterSpy writer) {
-    // Reset the state for each output, setting `wasOutput` to false for now
-    // (will set to true in the next loop for written assets).
+  /// - Setting the `lastKnownDigest` on each output based on the new contents.
+  /// - Setting the `previousInputsDigest` on each output based on the inputs.
+  Future<Null> _setOutputsState(Iterable<AssetId> declaredOutputs,
+      SingleStepReader reader, AssetWriterSpy writer) async {
+    // All inputs are the same, so we only compute this once, but lazily.
+    Digest inputsDigest;
+    Set<Glob> globsRan = reader.globsRan.toSet();
+
     for (var output in declaredOutputs) {
-      (_assetGraph.get(output) as GeneratedAssetNode)
+      var wasOutput = writer.assetsWritten.contains(output);
+      var digest = wasOutput ? await _reader.digest(output) : null;
+      var node = _assetGraph.get(output) as GeneratedAssetNode;
+
+      inputsDigest ??= await () {
+        var allInputs = reader.assetsRead.toSet();
+        if (node.primaryInput != null) allInputs.add(node.primaryInput);
+        return _computeCombinedDigest(allInputs, reader);
+      }();
+
+      // **IMPORTANT**: All updates to `node` must be synchronous. With lazy
+      // builders we can run arbitrary code between updates otherwise, at which
+      // time a node might not be in a valid state.
+      _removeOldInputs(node, reader.assetsRead);
+      _addNewInputs(node, reader.assetsRead);
+      node
         ..needsUpdate = false
-        ..wasOutput = false
-        ..globs = reader.globsRan.toSet();
+        ..wasOutput = wasOutput
+        ..lastKnownDigest = digest
+        ..globs = globsRan
+        ..previousInputsDigest = inputsDigest;
     }
+  }
 
-    // Mark the actual outputs as output.
-    for (var output in writer.assetsWritten) {
-      (_assetGraph.get(output) as GeneratedAssetNode).wasOutput = true;
+  /// Removes old inputs from [node] based on [updatedInputs], and cleans up all
+  /// the old edges.
+  void _removeOldInputs(GeneratedAssetNode node, Set<AssetId> updatedInputs) {
+    var removedInputs = node.inputs.difference(updatedInputs);
+    node.inputs.removeAll(removedInputs);
+    for (var input in removedInputs) {
+      // TODO: special type of dependency here? This means the primary input
+      // was never actually read.
+      if (input == node.primaryInput) continue;
+
+      var inputNode = _assetGraph.get(input);
+      assert(inputNode != null, 'Asset Graph is missing $input');
+      inputNode.outputs.remove(node.id);
     }
+  }
 
-    // Update the asset graph based on the dependencies discovered.
-    for (var dependency in reader.assetsRead) {
-      var dependencyNode = _assetGraph.get(dependency);
-      assert(dependencyNode != null, 'Asset Graph is missing $dependency');
-      // We care about all builderOutputs, not just real outputs. Updates
-      // to dependencies may cause a file to be output which wasn't before.
-      dependencyNode.outputs.addAll(declaredOutputs);
+  /// Adds new inputs to [node] based on [updatedInputs], and adds the
+  /// appropriate edges.
+  void _addNewInputs(GeneratedAssetNode node, Set<AssetId> updatedInputs) {
+    var newInputs = updatedInputs.difference(node.inputs);
+    node.inputs.addAll(newInputs);
+    for (var input in newInputs) {
+      var inputNode = _assetGraph.get(input);
+      assert(inputNode != null, 'Asset Graph is missing $input');
+      inputNode.outputs.add(node.id);
     }
   }
 

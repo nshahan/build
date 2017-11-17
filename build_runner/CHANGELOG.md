@@ -1,4 +1,51 @@
-## 0.6.0-dev
+## 0.6.1-dev
+
+### New Features
+
+- Add an `enableLowResourcesMode` option to `build` and `watch`, which will
+  consume less memory at the cost of slower builds. This is intended for use in
+  resource constrained environments such as Travis.
+- Add `createBuildActions`. After finding a list of Builders to run, and defining
+  which packages need them applied, use this tool to apply them in the correct
+  order across the package graph.
+
+### Deprecations
+
+- Deprecate `PackageGraph.orderedPackages` and `PackageGraph.dependentsOf`.
+
+### Internal Improvements
+
+- Outputs will no longer be rebuilt unless their inputs actually changed,
+  previously if any transtive dependency changed they would be invalidated.
+- Switched to using semantic analyzer summaries, this combined with the better
+  input validation means that, ddc/summary builds are much faster on non-api
+  affecting edits (dependent modules will no longer be rebuilt).
+- Build script invalidation is now much faster, which speeds up all builds.
+
+### Bug Fixes
+
+- The build actions are now checked against the previous builds actions, and if
+  they do not match then a full build is performed. Previously the behavior in
+  this case was undefined.
+- Fixed an issue where once an edge between an output and an input was created
+  it was never removed, causing extra builds to happen that weren't necessary.
+- Build actions are now checked for overlapping outputs in non-checked mode,
+  previously this was only an assert.
+- Fixed an issue where nodes could get in an inconsistent state for short
+  periods of time, leading to various errors.
+
+## 0.6.0+1
+
+### Internal Improvements
+
+- Now using `package:pool` to limit the number of open file handles.
+
+### Bug fixes
+
+- Fixed an issue where the asset graph could get in an invalid state if you
+  aren't setting `writeToCache: true`.
+
+## 0.6.0
 
 ### New features
 
@@ -14,10 +61,14 @@
 - **Breaking**: `PackageNode.location` has become `PackageNode.path`, and is
   now a `String` (absolute path) instead of a `Uri`; this prevents needing
   conversions to/from `Uri` across the package.
-- **Breaking**: `RunnerAssetReader` interface now extends
-  `MultiPackageAssetReader`, which means the `packageName` named argument has
-  changed to `package`; while technically breaking most users do not rely on
-  this interface explicitly.
+- **Breaking**: `RunnerAssetReader` interface requires you to implement
+  `MultiPackageAssetReader` and `DigestAssetReader`. This means the
+  `packageName` named argument has changed to `package`, and you have to add the
+  `Future<Digest> digest(AssetId id)` method. While technically breaking most
+  users do not rely on this interface explicitly.
+  - You also no longer have to implement the
+    `Future<DateTime> lastModified(AssetId id)` method, as it has been replaced
+    with the `DigestAssetReader` interface.
 - **Breaking**: `ServeHandler.handle` has been replaced with
   `Handler ServeHandler.handleFor(String rootDir)`. This allows you to create
   separate handlers per directory you want to serve, which maintains pub serve
@@ -34,6 +85,9 @@
 - Fixed two issues with `writeToCache`:
   - Over-declared outputs will no longer attempt to build on each startup.
   - Unrecognized files in the cache dir will no longer be treated as inputs.
+- Asset invalidation has changed from using last modified timestamps to content
+  hashes. This is generally much more reliable, and unblocks other desired
+  features.
 
 ### Internal changes
 

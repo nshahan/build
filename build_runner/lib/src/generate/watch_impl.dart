@@ -11,10 +11,12 @@ import 'package:logging/logging.dart';
 import 'package:watcher/watcher.dart';
 import 'package:stream_transform/stream_transform.dart';
 
+import '../asset/reader.dart';
+import '../asset/writer.dart';
 import '../asset_graph/graph.dart';
 import '../asset_graph/node.dart';
-import '../changes/build_script_updates.dart';
 import '../package_graph/package_graph.dart';
+import '../server/server.dart';
 import '../util/constants.dart';
 import 'build_definition.dart';
 import 'build_impl.dart';
@@ -22,8 +24,48 @@ import 'build_result.dart';
 import 'directory_watcher_factory.dart';
 import 'options.dart';
 import 'phase.dart';
+import 'terminator.dart';
 
 final _logger = new Logger('Watch');
+
+Future<ServeHandler> watch(List<BuildAction> buildActions,
+    {String buildDir,
+    bool deleteFilesByDefault,
+    bool writeToCache,
+    PackageGraph packageGraph,
+    RunnerAssetReader reader,
+    RunnerAssetWriter writer,
+    Level logLevel,
+    onLog(LogRecord record),
+    Duration debounceDelay,
+    DirectoryWatcherFactory directoryWatcherFactory,
+    Stream terminateEventStream,
+    bool skipBuildScriptCheck,
+    bool enableLowResourcesMode}) async {
+  var options = new BuildOptions(
+      buildDir: buildDir,
+      deleteFilesByDefault: deleteFilesByDefault,
+      writeToCache: writeToCache,
+      packageGraph: packageGraph,
+      reader: reader,
+      writer: writer,
+      logLevel: logLevel,
+      onLog: onLog,
+      debounceDelay: debounceDelay,
+      directoryWatcherFactory: directoryWatcherFactory,
+      skipBuildScriptCheck: skipBuildScriptCheck,
+      enableLowResourcesMode: enableLowResourcesMode);
+  var terminator = new Terminator(terminateEventStream);
+  var watch = runWatch(options, buildActions, terminator.shouldTerminate);
+
+  // ignore: unawaited_futures
+  watch.buildResults.drain().then((_) async {
+    await terminator.cancel();
+    await options.logListener.cancel();
+  });
+
+  return createServeHandler(watch);
+}
 
 /// Repeatedly run builds as files change on disk until [until] fires.
 ///
@@ -41,6 +83,7 @@ typedef Future<BuildResult> _BuildAction(List<List<AssetChange>> changes);
 
 class WatchImpl implements BuildState {
   AssetGraph _assetGraph;
+  BuildDefinition _buildDefinition;
 
   final String _buildDir;
 
@@ -59,8 +102,8 @@ class WatchImpl implements BuildState {
   /// Pending expected delete events from the build.
   final Set<AssetId> _expectedDeletes = new Set<AssetId>();
 
-  final _readerCompleter = new Completer<AssetReader>();
-  Future<AssetReader> get reader => _readerCompleter.future;
+  final _readerCompleter = new Completer<DigestAssetReader>();
+  Future<DigestAssetReader> get reader => _readerCompleter.future;
 
   WatchImpl(BuildOptions options, List<BuildAction> buildActions, Future until)
       : _buildDir = options.buildDir,
@@ -92,15 +135,18 @@ class WatchImpl implements BuildState {
 
     Future<BuildResult> doBuild(List<List<AssetChange>> changes) async {
       assert(build != null);
+      var mergedChanges = _collectChanges(changes);
 
       _expectedDeletes.clear();
-      if (await new BuildScriptUpdates(options)
-          .isNewerThan(_assetGraph.validAsOf)) {
-        fatalBuildCompleter.complete();
-        _logger.severe('Terminating builds due to build script update');
-        return new BuildResult(BuildStatus.failure, []);
+      if (!options.skipBuildScriptCheck) {
+        if (_buildDefinition.buildScriptUpdates
+            .hasBeenUpdated(mergedChanges.keys.toSet())) {
+          fatalBuildCompleter.complete();
+          _logger.severe('Terminating builds due to build script update');
+          return new BuildResult(BuildStatus.failure, []);
+        }
       }
-      return build.run(_collectChanges(changes));
+      return build.run(mergedChanges);
     }
 
     var terminate = Future.any([until, fatalBuildCompleter.future]).then((_) {
@@ -124,18 +170,21 @@ class WatchImpl implements BuildState {
         .transform(takeUntil(terminate))
         .transform(asyncMapBuffer(_recordCurrentBuild(doBuild)))
         .listen(controller.add)
-        .onDone(() {
+        .onDone(() async {
+          await _buildDefinition.resourceManager.beforeExit();
+          await controller.close();
           _logger.info('Builds finished. Safe to exit');
-          controller.close();
         });
 
     // Schedule the actual first build for the future so we can return the
     // stream synchronously.
     () async {
-      var buildDefinition = await BuildDefinition.load(options, buildActions);
-      _readerCompleter.complete(buildDefinition.reader);
-      _assetGraph = buildDefinition.assetGraph;
-      build = await BuildImpl.create(buildDefinition, buildActions,
+      _buildDefinition = await BuildDefinition.prepareWorkspace(
+          options, buildActions,
+          onDelete: _expectedDeletes.add);
+      _readerCompleter.complete(_buildDefinition.reader);
+      _assetGraph = _buildDefinition.assetGraph;
+      build = await BuildImpl.create(_buildDefinition, buildActions,
           onDelete: _expectedDeletes.add);
 
       controller.add(build.firstBuild);
@@ -154,7 +203,12 @@ class WatchImpl implements BuildState {
     if (_isBuildDirFile(change)) return false;
     if (_isCacheFile(change)) return false;
     if (_isGitFile(change)) return false;
-    if (_hasNoOutputs(change)) return false;
+    // If we haven't computed a digest for this asset and it has not outputs,
+    // then we don't care about changes to it.
+    //
+    // Checking for a digest alone isn't enough because a file may be deleted
+    // and re-added, in which case it won't have a digest.
+    if (_hasNoOutputs(change) && _hasNoDigest(change)) return false;
     if (_isEditOnGeneratedFile(change)) return false;
     if (_isExpectedDelete(change)) return false;
     if (_isUnwatchedDelete(change)) return false;
@@ -168,6 +222,10 @@ class WatchImpl implements BuildState {
   bool _isCacheFile(AssetChange change) => change.id.path.startsWith(cacheDir);
 
   bool _isGitFile(AssetChange change) => change.id.path.startsWith('.git/');
+
+  bool _hasNoDigest(AssetChange change) =>
+      _assetGraph.contains(change.id) &&
+      _assetGraph.get(change.id).lastKnownDigest == null;
 
   bool _hasNoOutputs(AssetChange change) =>
       _assetGraph.contains(change.id) &&

@@ -9,21 +9,22 @@ import 'package:analyzer/analyzer.dart';
 import 'package:build/build.dart';
 import 'package:path/path.dart' as _p; // ignore: library_prefixes
 
-import 'dev_compiler_builder.dart';
 import 'module_builder.dart';
 import 'modules.dart';
 
 /// Alias `_p.url` to `p`.
 _p.Context get p => _p.url;
 
-final String bootstrapJsExtension = '.dart.bootstrap.js';
-final String jsEntrypointExtension = '.dart.js';
-final String jsEntrypointSourceMapExtension = '.dart.js.map';
+const bootstrapJsExtension = '.dart.bootstrap.js';
+const jsEntrypointExtension = '.dart.js';
+const jsEntrypointSourceMapExtension = '.dart.js.map';
 
-class DevCompilerBootstrapBuilder extends Builder {
+class DevCompilerBootstrapBuilder implements Builder {
+  const DevCompilerBootstrapBuilder();
+
   @override
-  final buildExtensions = {
-    '.dart': [
+  final buildExtensions = const {
+    '.dart': const [
       bootstrapJsExtension,
       jsEntrypointExtension,
       jsEntrypointSourceMapExtension
@@ -42,7 +43,7 @@ class DevCompilerBootstrapBuilder extends Builder {
             as Map<String, dynamic>);
 
     // First, ensure all transitive modules are built.
-    await _ensureTransitiveModules(module, buildStep);
+    var transitiveDeps = await _ensureTransitiveModules(module, buildStep);
 
     var appModuleName = p.withoutExtension(module.jsId.path);
 
@@ -57,15 +58,16 @@ class DevCompilerBootstrapBuilder extends Builder {
     // which will allow us to not rely on the naming schemes that dartdevc uses
     // internally, but instead specify our own.
     var appModuleScope = p
-        .withoutExtension(p.basename(module.jsId.path))
+        .split(p.withoutExtension(module.jsId.path))
+        .skip(1)
+        .join('__')
         .replaceAll('.', '\$46');
 
     // Map from module name to module path for custom modules.
     var modulePaths = {'dart_sdk': 'packages/\$sdk/dev_compiler/amd/dart_sdk'};
     var transitiveNoneLibJsModules = [module.jsId]
-      ..addAll((await module.computeTransitiveDependencies(buildStep)))
-      ..where((dartId) => !dartId.path.startsWith('lib/'))
-          .map((dartId) => dartId.changeExtension(jsModuleExtension));
+      ..addAll((transitiveDeps).map((module) => module.jsId))
+      ..where((id) => !id.path.startsWith('lib/'));
     for (var module in transitiveNoneLibJsModules) {
       // Strip out the top level dir from the path for any non-lib module. We
       // set baseUrl to `/` to simplify things, and we only allow you to serve
@@ -97,20 +99,19 @@ class DevCompilerBootstrapBuilder extends Builder {
   }
 
   /// Ensures that all transitive js modules are available and built.
-  Future<Null> _ensureTransitiveModules(
+  Future<List<Module>> _ensureTransitiveModules(
       Module module, AssetReader reader) async {
     // Collect all the modules this module depends on, plus this module.
     var transitiveDeps = await module.computeTransitiveDependencies(reader);
-    var jsModules = transitiveDeps
-        .map((id) => id.changeExtension(jsModuleExtension))
-        .toList()
-          ..add(module.jsId);
+    var jsModules = transitiveDeps.map((module) => module.jsId).toList()
+      ..add(module.jsId);
     // Check that each module is readable, and warn otherwise.
     await Future.wait(jsModules.map((jsId) async {
       if (await reader.canRead(jsId)) return;
       log.warning(
           'Unable to read $jsId, check your console for compilation errors.');
     }));
+    return transitiveDeps;
   }
 
   /// Returns whether or not [dartId] is an app entrypoint (basically, whether

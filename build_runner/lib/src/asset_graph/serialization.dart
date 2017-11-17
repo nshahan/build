@@ -8,7 +8,7 @@ part of 'graph.dart';
 ///
 /// This should be incremented any time the serialize/deserialize formats
 /// change.
-const _version = 7;
+const _version = 12;
 
 /// Deserializes an [AssetGraph] from a [Map].
 class _AssetGraphDeserializer {
@@ -24,7 +24,8 @@ class _AssetGraphDeserializer {
           _serializedGraph['version'] as int, _version);
     }
 
-    var graph = new AssetGraph._();
+    var graph = new AssetGraph._(
+        _deserializeDigest(_serializedGraph['buildActionsDigest'] as String));
 
     // Read in the id => AssetId map from the graph first.
     for (var descriptor in _serializedGraph['serializedAssetIds']) {
@@ -32,37 +33,61 @@ class _AssetGraphDeserializer {
           new AssetId(descriptor[1] as String, descriptor[2] as String);
     }
 
+    // Read in all the nodes and their outputs.
+    //
+    // Note that this does not read in the inputs of generated nodes.
     for (var serializedItem in _serializedGraph['nodes']) {
       graph._add(_deserializeAssetNode(serializedItem as List));
     }
 
-    graph.validAsOf = new DateTime.fromMillisecondsSinceEpoch(
-        _serializedGraph['validAsOf'] as int);
+    // Update the inputs of all generated nodes based on the outputs of the
+    // current nodes.
+    for (var node in graph.allNodes) {
+      for (var output in node.outputs) {
+        var generatedNode = graph.get(output) as GeneratedAssetNode;
+        assert(generatedNode != null, 'Asset Graph is missing $output');
+        generatedNode.inputs.add(node.id);
+      }
+    }
+
     return graph;
   }
 
   AssetNode _deserializeAssetNode(List serializedNode) {
     AssetNode node;
-    if (serializedNode.length == 3) {
-      node = new AssetNode(_idToAssetId[serializedNode[0]]);
-    } else if (serializedNode.length == 8) {
-      node = new GeneratedAssetNode(
-        serializedNode[5] as int,
-        _idToAssetId[serializedNode[3]],
-        _deserializeBool(serializedNode[7] as int),
-        _deserializeBool(serializedNode[4] as int),
-        _idToAssetId[serializedNode[0]],
-        globs: (serializedNode[6] as Iterable<String>)
-            .map((pattern) => new Glob(pattern))
-            .toSet(),
-      );
-    } else {
-      throw new ArgumentError(
-          'Unrecognized serialization format! $serializedNode');
+    var typeId = _NodeType.values[serializedNode[_Field.NodeType.index] as int];
+    var id = _idToAssetId[serializedNode[_Field.Id.index] as int];
+    var serializedDigest = serializedNode[_Field.Digest.index] as String;
+    var digest = _deserializeDigest(serializedDigest);
+    switch (typeId) {
+      case _NodeType.Source:
+        assert(serializedNode.length == _WrappedAssetNode._length);
+        node = new SourceAssetNode(id, lastKnownDigest: digest);
+        break;
+      case _NodeType.Synthetic:
+        assert(serializedNode.length == _WrappedAssetNode._length);
+        node = new SyntheticAssetNode(id);
+        break;
+      case _NodeType.Generated:
+        assert(serializedNode.length == _WrappedGeneratedAssetNode._length);
+        node = new GeneratedAssetNode(
+            serializedNode[_Field.PhaseNumber.index] as int,
+            _idToAssetId[serializedNode[_Field.PrimaryInput.index] as int],
+            _deserializeBool(serializedNode[_Field.NeedsUpdate.index] as int),
+            _deserializeBool(serializedNode[_Field.WasOutput.index] as int),
+            id,
+            globs: (serializedNode[_Field.Globs.index] as Iterable<String>)
+                .map((pattern) => new Glob(pattern))
+                .toSet(),
+            lastKnownDigest: digest,
+            previousInputsDigest: _deserializeDigest(
+                serializedNode[_Field.PreviousInputsDigest.index] as String));
+        break;
     }
-    node.outputs.addAll(_deserializeAssetIds(serializedNode[1] as List<int>));
-    node.primaryOutputs
-        .addAll(_deserializeAssetIds(serializedNode[2] as List<int>));
+    node.outputs.addAll(_deserializeAssetIds(
+        serializedNode[_Field.Outputs.index] as List<int>));
+    node.primaryOutputs.addAll(_deserializeAssetIds(
+        serializedNode[_Field.PrimaryOutputs.index] as List<int>));
     return node;
   }
 
@@ -92,7 +117,7 @@ class _AssetGraphSerializer {
     var result = <String, dynamic>{
       'version': _version,
       'nodes': _graph.allNodes.map(_serializeNode).toList(),
-      'validAsOf': _graph.validAsOf.millisecondsSinceEpoch,
+      'buildActionsDigest': _serializeDigest(_graph.buildActionsDigest),
     };
 
     // Store the id => AssetId mapping as a nested list so we don't have to
@@ -116,6 +141,29 @@ class _AssetGraphSerializer {
   }
 }
 
+/// Used to serialize the type of a node using an int.
+enum _NodeType { Source, Synthetic, Generated }
+
+/// Field indexes for serialized nodes.
+enum _Field {
+  // First, the generic fields for all asset nodes.
+  NodeType,
+  Id,
+  Outputs,
+  PrimaryOutputs,
+  // **Note**: You must update `_WrappedAssetNode._length` if another generic
+  // field is added below `Digest`.
+  Digest,
+
+  // Fields below here are for generated nodes only.
+  PrimaryInput,
+  WasOutput,
+  PhaseNumber,
+  Globs,
+  NeedsUpdate,
+  PreviousInputsDigest
+}
+
 /// Wraps an [AssetNode] in a class that implements [List] instead of
 /// creating a new list for each one.
 class _WrappedAssetNode extends Object with ListMixin implements List {
@@ -124,23 +172,40 @@ class _WrappedAssetNode extends Object with ListMixin implements List {
 
   _WrappedAssetNode(this.node, this.serializer);
 
+  static final int _length = _Field.Digest.index + 1;
+
   @override
-  int get length => 3;
+  int get length => _length;
+
   @override
   set length(_) => throw new UnsupportedError(
       'length setter not unsupported for WrappedAssetNode');
 
   @override
   Object operator [](int index) {
-    switch (index) {
-      case 0:
+    var fieldId = _Field.values[index];
+    switch (fieldId) {
+      case _Field.NodeType:
+        if (node is SourceAssetNode) {
+          return _NodeType.Source.index;
+        } else if (node is GeneratedAssetNode) {
+          return _NodeType.Generated.index;
+        } else if (node is SyntheticAssetNode) {
+          return _NodeType.Synthetic.index;
+        } else {
+          throw new StateError('Unrecognized node type');
+        }
+        break;
+      case _Field.Id:
         return serializer._assetIdToId[node.id];
-      case 1:
+      case _Field.Outputs:
         return node.outputs.map((id) => serializer._assetIdToId[id]).toList();
-      case 2:
+      case _Field.PrimaryOutputs:
         return node.primaryOutputs
             .map((id) => serializer._assetIdToId[id])
             .toList();
+      case _Field.Digest:
+        return _serializeDigest(node.lastKnownDigest);
       default:
         throw new RangeError.index(index, this);
     }
@@ -156,8 +221,16 @@ class _WrappedAssetNode extends Object with ListMixin implements List {
 class _WrappedGeneratedAssetNode extends _WrappedAssetNode {
   final GeneratedAssetNode generatedNode;
 
+  /// Offset in the serialized format for additional fields in this class but
+  /// not in [_WrappedAssetNode].
+  ///
+  /// Indexes below this number are forwarded to `super[index]`.
+  static final int _serializedOffset = _WrappedAssetNode._length;
+
+  static final int _length = _Field.values.length;
+
   @override
-  int get length => super.length + 5;
+  int get length => _length;
 
   _WrappedGeneratedAssetNode(
       this.generatedNode, _AssetGraphSerializer serializer)
@@ -165,24 +238,34 @@ class _WrappedGeneratedAssetNode extends _WrappedAssetNode {
 
   @override
   Object operator [](int index) {
-    if (index < super.length) return super[index];
-    switch (index) {
-      case 3:
+    if (index < _serializedOffset) return super[index];
+    var fieldId = _Field.values[index];
+    switch (fieldId) {
+      case _Field.PrimaryInput:
         return generatedNode.primaryInput != null
             ? serializer._assetIdToId[generatedNode.primaryInput]
             : null;
-      case 4:
+      case _Field.WasOutput:
         return _serializeBool(generatedNode.wasOutput);
-      case 5:
+      case _Field.PhaseNumber:
         return generatedNode.phaseNumber;
-      case 6:
+      case _Field.Globs:
         return generatedNode.globs.map((glob) => glob.pattern).toList();
-      case 7:
+      case _Field.NeedsUpdate:
         return _serializeBool(generatedNode.needsUpdate);
+      case _Field.PreviousInputsDigest:
+        return _serializeDigest(generatedNode.previousInputsDigest);
       default:
         throw new RangeError.index(index, this);
     }
   }
-
-  static int _serializeBool(bool value) => value ? 1 : 0;
 }
+
+Digest _deserializeDigest(String serializedDigest) => serializedDigest == null
+    ? null
+    : new Digest(BASE64.decode(serializedDigest));
+
+String _serializeDigest(Digest digest) =>
+    digest == null ? null : BASE64.encode(digest.bytes);
+
+int _serializeBool(bool value) => value ? 1 : 0;

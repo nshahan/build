@@ -13,6 +13,7 @@ import 'package:watcher/watcher.dart';
 import 'package:build_runner/build_runner.dart';
 import 'package:build_runner/src/asset_graph/graph.dart';
 import 'package:build_runner/src/asset_graph/node.dart';
+import 'package:build_runner/src/generate/watch_impl.dart' as watch_impl;
 import 'package:build_test/build_test.dart';
 
 import '../common/common.dart';
@@ -63,7 +64,8 @@ void main() {
         result = await results.next;
         checkBuild(result, outputs: {'a|web/b.txt.copy': 'b'}, writer: writer);
         // Previous outputs should still exist.
-        expect(writer.assets[makeAssetId('a|web/a.txt.copy')].stringValue, 'a');
+        expect(writer.assets[makeAssetId('a|web/a.txt.copy')],
+            decodedMatches('a'));
       });
 
       test('rebuilds on deleted files', () async {
@@ -93,7 +95,8 @@ void main() {
         // The old output file should no longer exist either.
         expect(writer.assets[makeAssetId('a|web/a.txt.copy')], isNull);
         // Previous outputs should still exist.
-        expect(writer.assets[makeAssetId('a|web/b.txt.copy')].stringValue, 'b');
+        expect(writer.assets[makeAssetId('a|web/b.txt.copy')],
+            decodedMatches('b'));
       });
 
       test('rebuilds properly update asset_graph.json', () async {
@@ -109,49 +112,43 @@ void main() {
         await writer.writeAsString(makeAssetId('a|web/c.txt'), 'c');
         FakeWatcher.notifyWatchers(
             new WatchEvent(ChangeType.ADD, path.absolute('a', 'web', 'c.txt')));
+
+        await writer.writeAsString(makeAssetId('a|web/b.txt'), 'b2');
+        FakeWatcher.notifyWatchers(new WatchEvent(
+            ChangeType.MODIFY, path.absolute('a', 'web', 'b.txt')));
+
         // Don't call writer.delete, that has side effects.
         writer.assets.remove(makeAssetId('a|web/a.txt'));
         FakeWatcher.notifyWatchers(new WatchEvent(
             ChangeType.REMOVE, path.absolute('a', 'web', 'a.txt')));
 
         result = await results.next;
-        checkBuild(result, outputs: {'a|web/c.txt.copy': 'c'}, writer: writer);
+        checkBuild(result,
+            outputs: {'a|web/b.txt.copy': 'b2', 'a|web/c.txt.copy': 'c'},
+            writer: writer);
 
         var serialized = JSON.decode(
-            writer.assets[makeAssetId('a|$assetGraphPath')].stringValue) as Map;
+                UTF8.decode(writer.assets[makeAssetId('a|$assetGraphPath')]))
+            as Map;
         var cachedGraph = new AssetGraph.deserialize(serialized);
 
-        var expectedGraph = new AssetGraph.build([], new Set(), 'a');
+        var expectedGraph = await AssetGraph.build([], new Set(), 'a', null);
         var bCopyNode = new GeneratedAssetNode(null, makeAssetId('a|web/b.txt'),
-            false, true, makeAssetId('a|web/b.txt.copy'));
+            false, true, makeAssetId('a|web/b.txt.copy'),
+            lastKnownDigest: computeDigest('b2'),
+            inputs: [makeAssetId('a|web/b.txt')]);
         expectedGraph.add(bCopyNode);
-        expectedGraph.add(makeAssetNode('a|web/b.txt', [bCopyNode.id]));
+        expectedGraph.add(
+            makeAssetNode('a|web/b.txt', [bCopyNode.id], computeDigest('b2')));
         var cCopyNode = new GeneratedAssetNode(null, makeAssetId('a|web/c.txt'),
-            false, true, makeAssetId('a|web/c.txt.copy'));
+            false, true, makeAssetId('a|web/c.txt.copy'),
+            lastKnownDigest: computeDigest('c'),
+            inputs: [makeAssetId('a|web/c.txt')]);
         expectedGraph.add(cCopyNode);
-        expectedGraph.add(makeAssetNode('a|web/c.txt', [cCopyNode.id]));
+        expectedGraph.add(
+            makeAssetNode('a|web/c.txt', [cCopyNode.id], computeDigest('c')));
 
         expect(cachedGraph, equalsAssetGraph(expectedGraph));
-      });
-
-      test('build fails if script is updated after the first build starts',
-          () async {
-        var writer = new InMemoryRunnerAssetWriter();
-        var results = new StreamQueue(
-            startWatch([copyABuildAction], {'a|web/a.txt': 'a'}, writer));
-
-        var result = await results.next;
-        checkBuild(result, outputs: {'a|web/a.txt.copy': 'a'}, writer: writer);
-
-        /// Pretend like a part of the dart script got updated.
-        await writer.writeAsString(makeAssetId('test|lib/test.dart'), '',
-            lastModified: new DateTime.now().add(new Duration(days: 1)));
-        await writer.writeAsString(makeAssetId('a|web/a.txt'), 'b');
-        FakeWatcher.notifyWatchers(new WatchEvent(
-            ChangeType.MODIFY, path.absolute('a', 'web', 'a.txt')));
-
-        result = await results.next;
-        checkBuild(result, status: BuildStatus.failure);
       });
 
       test('ignores events from nested packages', () async {
@@ -165,7 +162,7 @@ void main() {
         var packageGraph = new PackageGraph.fromRoot(packageA);
 
         var results = new StreamQueue(startWatch([
-          copyABuildAction
+          copyABuildAction,
         ], {
           'a|web/a.txt': 'a',
           'b|web/b.txt': 'b'
@@ -190,12 +187,17 @@ void main() {
       });
 
       test('rebuilds on file updates during first build', () async {
+        var blocker = new Completer<Null>();
+        var buildAction =
+            new BuildAction(new CopyBuilder(blockUntil: blocker.future), 'a');
         var writer = new InMemoryRunnerAssetWriter();
         var results = new StreamQueue(
-            startWatch([copyABuildAction], {'a|web/a.txt': 'a'}, writer));
+            startWatch([buildAction], {'a|web/a.txt': 'a'}, writer));
 
+        await new Future(() {});
         FakeWatcher.notifyWatchers(new WatchEvent(
             ChangeType.MODIFY, path.absolute('a', 'web', 'a.txt')));
+        blocker.complete();
 
         var result = await results.next;
         // TODO: Move this up above the call to notifyWatchers once
@@ -259,9 +261,10 @@ void main() {
             outputs: {'a|web/b.txt.copy': 'b', 'a|web/b.txt.copy.copy': 'b'},
             writer: writer);
         // Previous outputs should still exist.
-        expect(writer.assets[makeAssetId('a|web/a.txt.copy')].stringValue, 'a');
-        expect(writer.assets[makeAssetId('a|web/a.txt.copy.copy')].stringValue,
-            'a');
+        expect(writer.assets[makeAssetId('a|web/a.txt.copy')],
+            decodedMatches('a'));
+        expect(writer.assets[makeAssetId('a|web/a.txt.copy.copy')],
+            decodedMatches('a'));
       });
 
       test('deletes propagate through all phases', () async {
@@ -298,9 +301,10 @@ void main() {
         expect(writer.assets[makeAssetId('a|web/a.txt.copy')], isNull);
         expect(writer.assets[makeAssetId('a|web/a.txt.copy.copy')], isNull);
         // Other outputs should still exist.
-        expect(writer.assets[makeAssetId('a|web/b.txt.copy')].stringValue, 'b');
-        expect(writer.assets[makeAssetId('a|web/b.txt.copy.copy')].stringValue,
-            'b');
+        expect(writer.assets[makeAssetId('a|web/b.txt.copy')],
+            decodedMatches('b'));
+        expect(writer.assets[makeAssetId('a|web/b.txt.copy.copy')],
+            decodedMatches('b'));
       });
 
       test('deleted generated outputs are regenerated', () async {
@@ -327,11 +331,11 @@ void main() {
             ChangeType.REMOVE, path.absolute('a', 'web', 'a.txt.copy')));
 
         result = await results.next;
-        // Should rebuild the generated asset and its outputs.
+        // Should rebuild the generated asset, but not its outputs because its
+        // content didn't change.
         checkBuild(result,
             outputs: {
               'a|web/a.txt.copy': 'a',
-              'a|web/a.txt.copy.copy': 'a',
             },
             writer: writer);
       });
@@ -411,7 +415,7 @@ Stream<BuildResult> startWatch(List<BuildAction> buildActions,
   }
   final watcherFactory = (String path) => new FakeWatcher(path);
 
-  var buildState = watch(buildActions,
+  var buildState = watch_impl.watch(buildActions,
       deleteFilesByDefault: true,
       debounceDelay: _debounceDelay,
       directoryWatcherFactory: watcherFactory,
@@ -419,7 +423,8 @@ Stream<BuildResult> startWatch(List<BuildAction> buildActions,
       writer: writer,
       packageGraph: packageGraph,
       terminateEventStream: _terminateWatchController.stream,
-      logLevel: Level.OFF);
+      logLevel: Level.OFF,
+      skipBuildScriptCheck: true);
   buildState
       .then((s) => buildResults.addStream(s.buildResults))
       .then((_) => buildResults.close());

@@ -16,14 +16,16 @@ import 'modules.dart';
 import 'scratch_space.dart';
 import 'workers.dart';
 
-final String linkedSummaryExtension = '.linked.sum';
-final String unlinkedSummaryExtension = '.unlinked.sum';
+const linkedSummaryExtension = '.linked.sum';
+const unlinkedSummaryExtension = '.unlinked.sum';
 
 /// A builder which can output unlinked summaries!
 class UnlinkedSummaryBuilder implements Builder {
+  const UnlinkedSummaryBuilder();
+
   @override
-  final buildExtensions = {
-    moduleExtension: [unlinkedSummaryExtension]
+  final buildExtensions = const {
+    moduleExtension: const [unlinkedSummaryExtension]
   };
 
   @override
@@ -33,7 +35,7 @@ class UnlinkedSummaryBuilder implements Builder {
             as Map<String, dynamic>);
     try {
       await createUnlinkedSummary(module, buildStep);
-    } catch (e, s) {
+    } on AnalyzerSummaryException catch (e, s) {
       log.warning('Error creating ${module.unlinkedSummaryId}:\n$e\n$s');
     }
   }
@@ -41,9 +43,11 @@ class UnlinkedSummaryBuilder implements Builder {
 
 /// A builder which can output linked summaries!
 class LinkedSummaryBuilder implements Builder {
+  const LinkedSummaryBuilder();
+
   @override
-  final buildExtensions = {
-    moduleExtension: [linkedSummaryExtension]
+  final buildExtensions = const {
+    moduleExtension: const [linkedSummaryExtension]
   };
 
   @override
@@ -53,7 +57,7 @@ class LinkedSummaryBuilder implements Builder {
             as Map<String, dynamic>);
     try {
       await createLinkedSummary(module, buildStep);
-    } catch (e, s) {
+    } on AnalyzerSummaryException catch (e, s) {
       log.warning('Error creating ${module.linkedSummaryId}:\n$e\n$s');
     }
   }
@@ -67,12 +71,10 @@ Future createUnlinkedSummary(Module module, BuildStep buildStep,
 
   var summaryOutputFile = scratchSpace.fileFor(module.unlinkedSummaryId);
   var request = new WorkRequest();
-  // TODO(jakemac53): Diet parsing results in erroneous errors in later steps,
-  // but ideally we would do that (pass '--build-summary-only-diet').
   request.arguments.addAll([
     '--build-summary-only',
     '--build-summary-only-unlinked',
-    '--build-summary-output=${summaryOutputFile.path}',
+    '--build-summary-output-semantic=${summaryOutputFile.path}',
     '--strong',
   ]);
 
@@ -82,7 +84,8 @@ Future createUnlinkedSummary(Module module, BuildStep buildStep,
 
   // Add all the files to include in the unlinked summary bundle.
   request.arguments.addAll(_analyzerSourceArgsForModule(module, scratchSpace));
-  var response = await analyzerDriver.doWork(request);
+  var analyzer = await buildStep.fetchResource(analyzerDriverResource);
+  var response = await analyzer.doWork(request);
   if (response.exitCode == EXIT_CODE_ERROR) {
     throw new AnalyzerSummaryException(
         module.unlinkedSummaryId, response.output);
@@ -101,30 +104,28 @@ Future createLinkedSummary(Module module, BuildStep buildStep,
 
   // Provide linked summaries where possible (if created in a previous phase),
   // otherwise provide unlinked summaries.
-  await Future.wait(transitiveDeps.map((dartId) async {
-    var linkedSummary = dartId.changeExtension(linkedSummaryExtension);
-    if (await buildStep.canRead(linkedSummary)) {
-      transitiveLinkedSummaryDeps.add(linkedSummary);
+  await Future.wait(transitiveDeps.map((module) async {
+    if (await buildStep.canRead(module.linkedSummaryId)) {
+      transitiveLinkedSummaryDeps.add(module.linkedSummaryId);
     } else {
-      transitiveUnlinkedSummaryDeps
-          .add(dartId.changeExtension(unlinkedSummaryExtension));
+      transitiveUnlinkedSummaryDeps.add(module.unlinkedSummaryId);
     }
   }));
 
   var scratchSpace = await buildStep.fetchResource(scratchSpaceResource);
 
   var allAssetIds = new Set<AssetId>()
+    // TODO: Why can't we just add the unlinked summary?
+    // That would help invalidation.
     ..addAll(module.sources)
     ..addAll(transitiveLinkedSummaryDeps)
     ..addAll(transitiveUnlinkedSummaryDeps);
   await scratchSpace.ensureAssets(allAssetIds, buildStep);
   var summaryOutputFile = scratchSpace.fileFor(module.linkedSummaryId);
   var request = new WorkRequest();
-  // TODO(jakemac53): Diet parsing results in erroneous errors in later steps,
-  // but ideally we would do that (pass '--build-summary-only-diet').
   request.arguments.addAll([
     '--build-summary-only',
-    '--build-summary-output=${summaryOutputFile.path}',
+    '--build-summary-output-semantic=${summaryOutputFile.path}',
     '--strong',
   ]);
 
@@ -140,8 +141,10 @@ Future createLinkedSummary(Module module, BuildStep buildStep,
 
   // Add all the files to include in the linked summary bundle.
   request.arguments.addAll(_analyzerSourceArgsForModule(module, scratchSpace));
-  var response = await analyzerDriver.doWork(request);
-  if (response.exitCode == EXIT_CODE_ERROR) {
+  var analyzer = await buildStep.fetchResource(analyzerDriverResource);
+  var response = await analyzer.doWork(request);
+  var summaryFile = scratchSpace.fileFor(module.linkedSummaryId);
+  if (response.exitCode == EXIT_CODE_ERROR || !await summaryFile.exists()) {
     throw new AnalyzerSummaryException(module.linkedSummaryId, response.output);
   }
 
@@ -155,7 +158,7 @@ Iterable<String> _analyzerSourceArgsForModule(
     var uri = canonicalUriFor(id);
     var file = scratchSpace.fileFor(id);
     if (!uri.startsWith('package:')) {
-      uri = file.uri.toString();
+      uri = new Uri.file('/${id.path}').toString();
     }
     return '$uri|${file.path}';
   });

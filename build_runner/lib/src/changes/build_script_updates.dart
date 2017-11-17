@@ -3,58 +3,97 @@
 // BSD-style license that can be found in the LICENSE file.
 
 import 'dart:async';
-import 'dart:io';
 import 'dart:mirrors';
 
 import 'package:build/build.dart';
-import 'package:build_runner/src/util/clock.dart';
 import 'package:logging/logging.dart';
-import 'package:path/path.dart' as path;
+import 'package:path/path.dart' as p;
 
-import '../asset/reader.dart';
+import '../asset_graph/graph.dart';
 import '../generate/options.dart';
 
 class BuildScriptUpdates {
-  final RunnerAssetReader _reader;
-  final _logger = new Logger('BuildScriptUpdates');
+  final Set<AssetId> _allSources;
+  final bool _supportsIncrementalRebuilds;
 
-  BuildScriptUpdates(BuildOptions options) : _reader = options.reader;
+  BuildScriptUpdates._(this._supportsIncrementalRebuilds, this._allSources);
 
-  /// Checks if the current running program has been updated since [time].
-  Future<bool> isNewerThan(DateTime time) async {
-    var urisInUse = currentMirrorSystem().libraries.keys;
-    var updateTimes = await Future.wait(urisInUse.map(_uriUpdateTime));
-    return updateTimes.any((u) => u.isAfter(time));
+  static Future<BuildScriptUpdates> create(
+      BuildOptions options, AssetGraph graph) async {
+    bool supportsIncrementalRebuilds = true;
+    var rootPackage = options.packageGraph.root.name;
+    Set<AssetId> allSources;
+    var logger = new Logger('BuildScriptUpdates');
+    try {
+      allSources = _urisForThisScript
+          .map((id) => _idForUri(id, rootPackage))
+          .where((id) => id != null)
+          .toSet();
+      var missing = allSources.firstWhere((id) => !graph.contains(id),
+          orElse: () => null);
+      if (missing != null) {
+        supportsIncrementalRebuilds = false;
+        logger.warning('$missing was not found in the asset graph, '
+            'incremental builds will not work.\n This probably means you '
+            'don\'t have your dependencies specified fully in your '
+            'pubspec.yaml.');
+      } else {
+        // Make sure we are tracking changes for all ids in [allSources].
+        for (var id in allSources) {
+          var node = graph.get(id);
+          if (node.lastKnownDigest == null) {
+            node.lastKnownDigest = await options.reader.digest(id);
+          }
+        }
+      }
+    } on ArgumentError catch (_) {
+      supportsIncrementalRebuilds = false;
+      allSources = new Set<AssetId>();
+    }
+    return new BuildScriptUpdates._(supportsIncrementalRebuilds, allSources);
   }
 
-  Future<DateTime> _uriUpdateTime(Uri uri) async {
+  static Iterable<Uri> get _urisForThisScript =>
+      currentMirrorSystem().libraries.keys;
+
+  /// Checks if the current running program has been updated, based on
+  /// [updatedIds].
+  bool hasBeenUpdated(Set<AssetId> updatedIds) {
+    if (!_supportsIncrementalRebuilds) return true;
+    return updatedIds.intersection(_allSources).isNotEmpty;
+  }
+
+  /// Attempts to return an [AssetId] for [uri].
+  ///
+  /// Returns `null` if the uri should be ignored, or throws an [ArgumentError]
+  /// if the [uri] is not recognized.
+  static AssetId _idForUri(Uri uri, String _rootPackage) {
     switch (uri.scheme) {
       case 'dart':
-        return new DateTime.fromMillisecondsSinceEpoch(0);
+        // TODO: check for sdk updates!
+        break;
       case 'package':
         var parts = uri.pathSegments;
-        var id = new AssetId(parts[0],
-            path.url.joinAll(['lib']..addAll(parts.getRange(1, parts.length))));
-        return _reader.lastModified(id);
+        return new AssetId(parts[0],
+            p.url.joinAll(['lib']..addAll(parts.getRange(1, parts.length))));
       case 'file':
-
-        // TODO(jakemac): Probably shouldn't use dart:io directly, but its
-        // definitely the easiest solution and should be fine.
-        var file = new File.fromUri(uri);
-        return file.lastModified();
+        var relativePath = p.relative(uri.path, from: p.current);
+        return new AssetId(_rootPackage, relativePath);
       case 'data':
-
         // Test runner uses a `data` scheme, don't invalidate for those.
-        if (uri.path.contains('package:test')) {
-          return new DateTime.fromMillisecondsSinceEpoch(0);
-        }
+        if (uri.path.contains('package:test')) break;
+        continue unsupported;
+      case 'http':
+        continue unsupported;
+      unsupported:
+      default:
+        throw new ArgumentError(
+            'Unsupported uri scheme `${uri.scheme}` found for '
+            'library in build script.\n'
+            'This probably means you are running in an unsupported '
+            'context, such as in an isolate or via `pub run`.\n'
+            'Full uri was: $uri.');
     }
-    _logger.info('Unsupported uri scheme `${uri.scheme}` found for '
-        'library in build script, falling back on full rebuild. '
-        '\nThis probably means you are running in an unsupported '
-        'context, such as in an isolate or via `pub run`. Instead you '
-        'should invoke this script directly like: '
-        '`dart path_to_script.dart`.');
-    return now();
+    return null;
   }
 }

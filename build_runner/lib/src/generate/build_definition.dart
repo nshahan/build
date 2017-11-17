@@ -4,6 +4,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:build/build.dart';
 import 'package:glob/glob.dart';
@@ -11,6 +12,7 @@ import 'package:logging/logging.dart';
 import 'package:watcher/watcher.dart';
 
 import '../asset/build_cache.dart';
+import '../asset/reader.dart';
 import '../asset/writer.dart';
 import '../asset_graph/exceptions.dart';
 import '../asset_graph/graph.dart';
@@ -29,42 +31,110 @@ final _logger = new Logger('BuildDefinition');
 class BuildDefinition {
   final AssetGraph assetGraph;
 
-  /// Assets which have changed since the cached asset graph was created.
-  final Map<AssetId, ChangeType> updates;
-
-  /// Assets which should be generated but already exist on disk and can't be
-  /// proven to be from the last build.
-  final Set<AssetId> conflictingAssets;
-
-  final AssetReader reader;
+  final DigestAssetReader reader;
   final RunnerAssetWriter writer;
 
   final PackageGraph packageGraph;
   final bool deleteFilesByDefault;
+  final ResourceManager resourceManager;
+
+  final BuildScriptUpdates buildScriptUpdates;
+
+  /// Whether or not to run in a mode that conserves RAM at the cost of build
+  /// speed.
+  final bool enableLowResourcesMode;
+
+  final OnDelete onDelete;
+
   final String buildDir;
 
   BuildDefinition._(
       this.assetGraph,
-      this.updates,
-      this.conflictingAssets,
       this.reader,
       this.writer,
       this.packageGraph,
       this.deleteFilesByDefault,
+      this.resourceManager,
+      this.buildScriptUpdates,
+      this.enableLowResourcesMode,
+      this.onDelete,
       this.buildDir);
 
-  static Future<BuildDefinition> load(
-          BuildOptions options, List<BuildAction> buildActions) =>
-      new _Loader(options, buildActions).load();
+  static Future<BuildDefinition> prepareWorkspace(
+          BuildOptions options, List<BuildAction> buildActions,
+          {void onDelete(AssetId id)}) =>
+      new _Loader(options, buildActions, onDelete).prepareWorkspace();
 }
 
 class _Loader {
   final List<BuildAction> _buildActions;
   final BuildOptions _options;
+  final OnDelete _onDelete;
 
-  _Loader(this._options, this._buildActions);
+  _Loader(this._options, this._buildActions, this._onDelete);
 
-  Future<BuildDefinition> load() async {
+  Future<BuildDefinition> prepareWorkspace() async {
+    _checkBuildActions();
+
+    _logger.info('Initializing inputs');
+    var inputSources = await _findInputSources();
+    var cacheDirSources = await _findCacheDirSources();
+    var allSources = inputSources.union(cacheDirSources);
+
+    var assetGraph = await _tryReadCachedAssetGraph();
+
+    BuildScriptUpdates buildScriptUpdates;
+    if (assetGraph != null) {
+      var updates = await _updateAssetGraph(
+          assetGraph, inputSources, cacheDirSources, allSources);
+
+      buildScriptUpdates =
+          await BuildScriptUpdates.create(_options, assetGraph);
+      if (!_options.skipBuildScriptCheck &&
+          buildScriptUpdates.hasBeenUpdated(updates.keys.toSet())) {
+        _logger.warning('Invalidating asset graph due to build script update');
+        assetGraph = null;
+        buildScriptUpdates = null;
+      }
+    }
+
+    if (assetGraph == null) {
+      Set<AssetId> conflictingOutputs;
+
+      await logTimedAsync(_logger, 'Building new asset graph', () async {
+        assetGraph = await AssetGraph.build(_buildActions, inputSources,
+            _options.packageGraph.root.name, _options.reader);
+        buildScriptUpdates =
+            await BuildScriptUpdates.create(_options, assetGraph);
+        conflictingOutputs =
+            assetGraph.outputs.where(allSources.contains).toSet();
+      });
+
+      await logTimedAsync(
+          _logger,
+          'Checking for unexpected pre-existing outputs.',
+          () => _initialBuildCleanup(
+              conflictingOutputs,
+              _options.deleteFilesByDefault,
+              _maybeWrapWriter(_options.writer, assetGraph)));
+    }
+
+    return new BuildDefinition._(
+        assetGraph,
+        _maybeWrapReader(_options.reader, assetGraph),
+        _maybeWrapWriter(_options.writer, assetGraph),
+        _options.packageGraph,
+        _options.deleteFilesByDefault,
+        new ResourceManager(),
+        buildScriptUpdates,
+        _options.enableLowResourcesMode,
+        _onDelete,
+        _options.buildDir);
+  }
+
+  /// Checks that the [_buildActions] are valid based on the
+  /// `_options.writeToCache` setting.
+  void _checkBuildActions() {
     if (!_options.writeToCache) {
       final root = _options.packageGraph.root.name;
       for (final action in _buildActions) {
@@ -73,69 +143,89 @@ class _Loader {
         }
       }
     }
-    final assetGraphId =
-        new AssetId(_options.packageGraph.root.name, assetGraphPath);
-    AssetGraph assetGraph;
-    final conflictingOutputs = new Set<AssetId>();
-    _logger.info('Initializing inputs');
-    var inputSources = await _findInputSources();
-    var cacheDirSources = new Set<AssetId>();
-    if (_options.writeToCache) {
-      cacheDirSources.addAll(await _listGeneratedAssetIds().toList());
-    }
-    var allSources = inputSources.union(cacheDirSources);
-    var updates = <AssetId, ChangeType>{};
-    await logTimedAsync(_logger, 'Reading cached dependency graph', () async {
-      if (await _options.reader.canRead(assetGraphId)) {
-        assetGraph = await _readAssetGraph(assetGraphId);
-      }
-      if (assetGraph != null &&
-          await new BuildScriptUpdates(_options)
-              .isNewerThan(assetGraph.validAsOf)) {
-        _logger.warning('Invalidating asset graph due to build script update');
-        assetGraph = null;
-      }
-      if (assetGraph == null) {
-        assetGraph = new AssetGraph.build(
-            _buildActions, inputSources, _options.packageGraph.root.name);
-        conflictingOutputs
-            .addAll(assetGraph.outputs.where(allSources.contains).toSet());
-      } else {
-        _logger.info('Updating asset graph with changes since last build.');
-        updates.addAll(await _findUpdates(
-            assetGraph, inputSources, cacheDirSources, allSources));
-      }
-    });
-    AssetReader reader = _options.reader;
-    var writer = _options.writer;
-    if (_options.writeToCache) {
-      reader = new BuildCacheReader(
-          reader, assetGraph, _options.packageGraph.root.name);
-      writer = new BuildCacheWriter(writer, assetGraph,
-          _options.packageGraph.root.name, _options.buildDir);
-    }
-    return new BuildDefinition._(
-        assetGraph,
-        updates,
-        conflictingOutputs,
-        reader,
-        writer,
-        _options.packageGraph,
-        _options.deleteFilesByDefault,
-        _options.buildDir);
   }
 
-  /// Reads in an [AssetGraph] from disk.
-  Future<AssetGraph> _readAssetGraph(AssetId assetGraphId) async {
-    try {
-      return new AssetGraph.deserialize(
-          JSON.decode(await _options.reader.readAsString(assetGraphId)) as Map);
-    } on AssetGraphVersionException catch (_) {
-      // Start fresh if the cached asset_graph version doesn't match up with
-      // the current version. We don't currently support old graph versions.
-      _logger.info('Throwing away cached asset graph due to version mismatch.');
+  /// If `_options.writeToCache` is `true` then this returns the all the sources
+  /// found in the cache directory, otherwise it returns an empty set.
+  Future<Set<AssetId>> _findCacheDirSources() {
+    if (_options.writeToCache) {
+      return _listGeneratedAssetIds().toSet();
+    }
+    return new Future.value(new Set<AssetId>());
+  }
+
+  /// Attempts to read in an [AssetGraph] from disk, and returns `null` if it
+  /// fails for any reason.
+  Future<AssetGraph> _tryReadCachedAssetGraph() async {
+    final assetGraphId =
+        new AssetId(_options.packageGraph.root.name, assetGraphPath);
+    if (!await _options.reader.canRead(assetGraphId)) {
       return null;
     }
+
+    return logTimedAsync(_logger, 'Reading cached asset graph', () async {
+      try {
+        var cachedGraph = new AssetGraph.deserialize(JSON
+            .decode(await _options.reader.readAsString(assetGraphId)) as Map);
+        if (computeBuildActionsDigest(_buildActions) !=
+            cachedGraph.buildActionsDigest) {
+          _logger.warning(
+              'Throwing away cached asset graph because the build actions have '
+              'changed. This could happen as a result of adding a new '
+              'dependency, or if you are using a build script which changes '
+              'the build structure based on command line flags or other '
+              'configuration.');
+          return null;
+        }
+        return cachedGraph;
+      } on AssetGraphVersionException catch (_) {
+        // Start fresh if the cached asset_graph version doesn't match up with
+        // the current version. We don't currently support old graph versions.
+        _logger.warning(
+            'Throwing away cached asset graph due to version mismatch.');
+        return null;
+      }
+    });
+  }
+
+  /// Updates [assetGraph] based on a the new view of the world.
+  ///
+  /// Once done, this returns a map of [AssetId] to [ChangeType] for all the
+  /// changes.
+  Future<Map<AssetId, ChangeType>> _updateAssetGraph(
+      AssetGraph assetGraph,
+      Set<AssetId> inputSources,
+      Set<AssetId> cacheDirSources,
+      Set<AssetId> allSources) async {
+    var updates = await _findUpdates(
+        assetGraph, inputSources, cacheDirSources, allSources);
+    await assetGraph.updateAndInvalidate(
+        _buildActions,
+        updates,
+        _options.packageGraph.root.name,
+        (id) => _delete(id, _maybeWrapWriter(_options.writer, assetGraph)),
+        _maybeWrapReader(_options.reader, assetGraph));
+    return updates;
+  }
+
+  /// Wraps [original] in a [BuildCacheWriter] if `_options.writeToCache` is
+  /// `true`.
+  RunnerAssetWriter _maybeWrapWriter(
+      RunnerAssetWriter original, AssetGraph assetGraph) {
+    assert(assetGraph != null);
+    if (!_options.writeToCache) return original;
+    return new BuildCacheWriter(original, assetGraph,
+        _options.packageGraph.root.name, _options.buildDir);
+  }
+
+  /// Wraps [original] in a [BuildCacheReader] if `_options.writeToCache` is
+  /// `true`.
+  DigestAssetReader _maybeWrapReader(
+      DigestAssetReader original, AssetGraph assetGraph) {
+    assert(assetGraph != null);
+    if (!_options.writeToCache) return original;
+    return new BuildCacheReader(
+        original, assetGraph, _options.packageGraph.root.name);
   }
 
   /// Finds the asset changes which have happened while unwatched between builds
@@ -153,12 +243,17 @@ class _Loader {
       }
     }
 
-    var newSources = inputSources
-        .difference(assetGraph.allNodes.map((node) => node.id).toSet());
+    var newSources = inputSources.difference(assetGraph.allNodes
+        .where((node) => node is! SyntheticAssetNode)
+        .map((node) => node.id)
+        .toSet());
     addUpdates(newSources, ChangeType.ADD);
     var removedAssets = assetGraph.allNodes
-        .where((n) =>
-            n is! GeneratedAssetNode || (n as GeneratedAssetNode).wasOutput)
+        .where((n) {
+          if (n is SyntheticAssetNode) return false;
+          if (n is GeneratedAssetNode) return n.wasOutput;
+          return true;
+        })
         .map((n) => n.id)
         .where((id) => !allSources.contains((id)));
 
@@ -167,8 +262,10 @@ class _Loader {
     var remainingSources =
         assetGraph.sources.toSet().intersection(inputSources);
     var modifyChecks = remainingSources.map((id) async {
-      var modified = await _options.reader.lastModified(id);
-      if (modified.isAfter(assetGraph.validAsOf)) {
+      var node = assetGraph.get(id);
+      var originalDigest = node.lastKnownDigest;
+      var currentDigest = await _options.reader.digest(id);
+      if (currentDigest != originalDigest) {
         updates[id] = ChangeType.MODIFY;
       }
     });
@@ -181,15 +278,12 @@ class _Loader {
     var inputSets = _options.packageGraph.allPackages.values.map((package) =>
         new InputSet(package.name, package.includes,
             excludes: package.excludes));
-    var sources = _listAssetIds(inputSets).where(_isValidInput).toSet();
+    var sources = (await _listAssetIds(inputSets).toSet())
+      ..addAll(await _options.reader
+          .findAssets(new Glob('$entryPointDir/**'))
+          .toSet());
     return sources;
   }
-
-  /// Checks if an [input] is valid.
-  bool _isValidInput(AssetId input) =>
-      input.package != _options.packageGraph.root.name
-          ? input.path.startsWith('lib/')
-          : !toolDirs.any((d) => input.path.startsWith(d));
 
   Stream<AssetId> _listAssetIds(Iterable<InputSet> inputSets) async* {
     var seenAssets = new Set<AssetId>();
@@ -214,5 +308,64 @@ class _Loader {
       var path = packagePath.substring(firstSlash + 1);
       yield new AssetId(package, path);
     }
+  }
+
+  /// Handles cleanup of pre-existing outputs for initial builds (where there is
+  /// no cached graph).
+  Future<Null> _initialBuildCleanup(Set<AssetId> conflictingAssets,
+      bool deleteFilesByDefault, RunnerAssetWriter writer) async {
+    if (conflictingAssets.isEmpty) return;
+
+    // Skip the prompt if using this option.
+    if (deleteFilesByDefault) {
+      _logger.info('Deleting ${conflictingAssets.length} declared outputs '
+          'which already existed on disk.');
+      await Future.wait(conflictingAssets.map((id) => _delete(id, writer)));
+      return;
+    }
+
+    // Prompt the user to delete files that are declared as outputs.
+    _logger.info('Found ${conflictingAssets.length} declared outputs '
+        'which already exist on disk. This is likely because the'
+        '`$cacheDir` folder was deleted, or you are submitting generated '
+        'files to your source repository.');
+
+    // If not in a standard terminal then we just exit, since there is no way
+    // for the user to provide a yes/no answer.
+    bool runningInPubRunTest() => Platform.script.scheme == 'data';
+    if (stdioType(stdin) != StdioType.TERMINAL || runningInPubRunTest()) {
+      throw new UnexpectedExistingOutputsException(conflictingAssets);
+    }
+
+    // Give a little extra space after the last message, need to make it clear
+    // this is a prompt.
+    stdout.writeln();
+    var done = false;
+    while (!done) {
+      stdout.write('\nDelete these files (y/n) (or list them (l))?: ');
+      var input = stdin.readLineSync();
+      switch (input.toLowerCase()) {
+        case 'y':
+          stdout.writeln('Deleting files...');
+          done = true;
+          await Future.wait(conflictingAssets.map((id) => _delete(id, writer)));
+          break;
+        case 'n':
+          throw new UnexpectedExistingOutputsException(conflictingAssets);
+          break;
+        case 'l':
+          for (var output in conflictingAssets) {
+            stdout.writeln(output);
+          }
+          break;
+        default:
+          stdout.writeln('Unrecognized option $input, (y/n/l) expected.');
+      }
+    }
+  }
+
+  Future _delete(AssetId id, RunnerAssetWriter writer) {
+    _onDelete?.call(id);
+    return writer.delete(id);
   }
 }

@@ -17,15 +17,17 @@ import 'scratch_space.dart';
 import 'summary_builder.dart';
 import 'workers.dart';
 
-final String jsModuleErrorsExtension = '.js.errors';
-final String jsModuleExtension = '.js';
-final String jsSourceMapExtension = '.js.map';
+const jsModuleErrorsExtension = '.js.errors';
+const jsModuleExtension = '.js';
+const jsSourceMapExtension = '.js.map';
 
 /// A builder which can output ddc modules!
 class DevCompilerBuilder implements Builder {
+  const DevCompilerBuilder();
+
   @override
-  final buildExtensions = {
-    moduleExtension: [
+  final buildExtensions = const {
+    moduleExtension: const [
       jsModuleExtension,
       jsModuleErrorsExtension,
       jsSourceMapExtension
@@ -40,9 +42,9 @@ class DevCompilerBuilder implements Builder {
     try {
       await createDevCompilerModule(module, buildStep);
     } on DartDevcCompilationException catch (e) {
-      log.warning('Error compiling ${module.jsId}:\n$e');
       await buildStep.writeAsString(
           buildStep.inputId.changeExtension(jsModuleErrorsExtension), '$e');
+      log.severe('', e);
     }
   }
 }
@@ -52,7 +54,7 @@ Future createDevCompilerModule(Module module, BuildStep buildStep,
     {bool debugMode = true}) async {
   var transitiveDeps = await module.computeTransitiveDependencies(buildStep);
   var transitiveSummaryDeps =
-      transitiveDeps.map((id) => id.changeExtension(linkedSummaryExtension));
+      transitiveDeps.map((module) => module.linkedSummaryId);
   var scratchSpace = await buildStep.fetchResource(scratchSpaceResource);
 
   var allAssetIds = new Set<AssetId>()
@@ -60,6 +62,7 @@ Future createDevCompilerModule(Module module, BuildStep buildStep,
     ..addAll(transitiveSummaryDeps);
   await scratchSpace.ensureAssets(allAssetIds, buildStep);
   var jsOutputFile = scratchSpace.fileFor(module.jsId);
+  var libraryRoot = '/${p.split(p.dirname(module.jsId.path)).first}';
   var sdkSummary = p.url.join(sdkDir, 'lib/_internal/ddc_sdk.sum');
   var request = new WorkRequest();
 
@@ -67,8 +70,8 @@ Future createDevCompilerModule(Module module, BuildStep buildStep,
     '--dart-sdk-summary=$sdkSummary',
     '--modules=amd',
     '--dart-sdk=${sdkDir}',
-    '--module-root=${scratchSpace.tempDir.path}',
-    '--library-root=${p.dirname(jsOutputFile.path)}',
+    '--module-root=.',
+    '--library-root=$libraryRoot',
     '--summary-extension=${linkedSummaryExtension.substring(1)}',
     '--no-summarize',
     '-o',
@@ -96,11 +99,16 @@ Future createDevCompilerModule(Module module, BuildStep buildStep,
 
   // Add URL mappings for all the package: files to tell DartDevc where to
   // find them.
+  //
+  // For non-lib files we use "fake" absolute file uris, using `id.path`.
   for (var id in module.sources) {
     var uri = canonicalUriFor(id);
     if (uri.startsWith('package:')) {
       request.arguments
           .add('--url-mapping=$uri,${scratchSpace.fileFor(id).path}');
+    } else {
+      var absoluteFileUri = new Uri.file('/${id.path}');
+      request.arguments.add('--url-mapping=$absoluteFileUri,${id.path}');
     }
   }
 
@@ -111,17 +119,18 @@ Future createDevCompilerModule(Module module, BuildStep buildStep,
     if (uri.startsWith('package:')) {
       return uri;
     }
-    return scratchSpace.fileFor(id).path;
+    return new Uri.file('/${id.path}').toString();
   }));
 
-  var response = await dartdevcDriver.doWork(request);
+  var dartdevc = await buildStep.fetchResource(dartdevcDriverResource);
+  var response = await dartdevc.doWork(request);
   // TODO(jakemac53): Fix the ddc worker mode so it always sends back a bad
   // status code if something failed. Today we just make sure there is an output
   // JS file to verify it was successful.
   if (response.exitCode != EXIT_CODE_OK || !jsOutputFile.existsSync()) {
     var message =
         response.output.replaceAll('${scratchSpace.tempDir.path}/', '');
-    throw new DartDevcCompilationException(module.jsId, message);
+    throw new DartDevcCompilationException(module.jsId, '$message\n$request}');
   } else {
     // Copy the output back using the buildStep.
     await scratchSpace.copyOutput(module.jsId, buildStep);
