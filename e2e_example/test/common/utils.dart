@@ -154,20 +154,28 @@ Future<String> nextStdErrLine(String message) =>
 Future<String> nextStdOutLine(String message) =>
     _stdOutLines.firstWhere((line) => line.contains(message)) as Future<String>;
 
-Future<ProcessResult> runTests() =>
-    Process.run('pub', ['run', 'test', '--pub-serve', '8081', '-p', 'chrome']);
+Future<ProcessResult> runTests({bool usePrecompiled}) {
+  usePrecompiled ??= false;
+  var args = ['run', 'test', '-p', 'chrome'];
+  if (usePrecompiled) {
+    args.addAll(['--precompiled', 'build/']);
+  } else {
+    args.addAll(['--pub-serve', '8081']);
+  }
+  return Process.run('pub', args);
+}
 
 Future<Null> expectTestsFail() async {
   var result = await runTests();
   expect(result.stdout, contains('Some tests failed'));
 }
 
-Future<Null> expectTestsPass([int numRan]) async {
-  var result = await runTests();
+Future<Null> expectTestsPass({int expectedNumRan, bool usePrecompiled}) async {
+  var result = await runTests(usePrecompiled: usePrecompiled);
   expect(result.stdout, contains('All tests passed!'));
-  if (numRan != null) {
-    expect(result.stdout, contains('+$numRan'));
-    expect(result.stdout, isNot(contains('+${numRan + 1}')));
+  if (expectedNumRan != null) {
+    expect(result.stdout, contains('+$expectedNumRan'));
+    expect(result.stdout, isNot(contains('+${expectedNumRan + 1}')));
   }
 }
 
