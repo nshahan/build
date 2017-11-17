@@ -200,7 +200,7 @@ class WatchImpl implements BuildState {
   /// Checks if we should skip a watch event for this [change].
   bool _shouldProcess(AssetChange change) {
     assert(_assetGraph != null);
-    if (_isBuildDirFile(change)) return false;
+    if (_buildDir != null && _isBuildDirFile(change)) return false;
     if (_isCacheFile(change)) return false;
     if (_isGitFile(change)) return false;
     // If we haven't computed a digest for this asset and it has not outputs,
